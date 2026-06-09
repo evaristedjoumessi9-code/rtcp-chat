@@ -8,59 +8,129 @@
   <body>
     <video id="localVideo" autoplay muted></video>
     <video id="remoteVideo" autoplay ></video>
-    <button id="init" >Rejoins</button>
-    <button id="offerer" >Cree l'offre</button>
     <label for="messenger"></label>
-    <input type="text" name="" id="messenger">
-    <button id="sender">envoyer ce message</button>
     <div id="messages" ></div>
+    <div id="tools"></div>
     <script src="node_modules/socket.io-client/dist/socket.io.min.js" ></script>
     <script type="module">
-
-    const socket = io("http://localhost:8080"); //On initialise socket.io icion utilise par defaul le port 8080
-    const initialiseur = document.querySelector("#init"); //Ce bouton sert a rejoindre la room
-    const offerer = document.querySelector("#offerer"); //Celui ci sert a creer l'offre. Un seul utilisateur doit cliquer dessus
+      class RTCPeerConnectionWrap{
+        static all = [];
+        constructor(config,idRoom){
+          this.connection = new RTCPeerConnection(config||null);
+          this.roomId = idRoom;
+          this.datachannel = null;
+          RTCPeerConnectionWrap.all.push(this)
+        }
+      }
+    const tools = document.querySelector("#tools");
+    const socket = io("http://localhost:8080"); //On initialise socket.io. ici on utilise par defaul le port 8080
     const localVideo = document.querySelector("#localVideo");//Video locale. Il s.agit de l'image de la webcam de l'utilisateur
     const remoteVideo = document.querySelector("#remoteVideo");//image de la webcam de l'interlocuteur
     const messages = document.querySelector("#messages");//div qui contiendra les messages envoyes 
-    const messenger = document.querySelector("#messenger");// input qui ou l'utilisateur ecrit le message
-    const sender = document.querySelector("#sender");//Button qui envoie les messages
-    let peer,localStream,datachannel; // peer est le pair local, localstream est le stream de la webcam, datachannel est le canal de donnee arbitraire
     const config = {
       iceServers:[{
         urls:"stun:stun.l.google.com:19302"
       }]
     }; // Informations de configuration du serveur stun
     const roomId = "room1"; // Nom de la room
-
+    let ID;
     //Ici, on gere le cas ou le remote envoie l'offre. Elle transite par socket.io et nous arrive
-    socket.on("offer", async offer =>{
-      await peer.setRemoteDescription(offer); //On recoie l'offre, on l'accepte ...
-      const answer = await peer.createAnswer();//On cree une reponse
-      await peer.setLocalDescription(answer);
+    function format(remoteId){
+        return  ID+"#"+remoteId;
+      }
+
+      function scale(datachannel){
+        const texter = document.createElement("input");
+        const sender  = document.createElement("button");
+        texter.type="text";
+        sender.textContent = "Envoyer";
+        sender.onclick = ()=>{
+          addMessage(texter.value);
+          datachannel.send(texter.value)
+        }
+        const container = document.createElement("div");
+        container.appendChild(texter);
+        container.appendChild(sender);
+        tools.appendChild(container);
+      }
+    async function createOffer(id) {
+        const wrap = RTCPeerConnectionWrap.all.filter(x=>x.roomId==id)[0];
+        const datachannel = wrap.connection.createDataChannel(id);
+        wrap.datachannel = datachannel;
+        console.log(datachannel);
+        datachannel.onopen = ()=>{
+          console.log("data channel is on");
+          scale(datachannel);
+        }
+        datachannel.onmessage = event=>{
+          addMessage("Remote "+id+": "+event.data);
+        }
+        const offer = await wrap.connection.createOffer();
+        await wrap.connection.setLocalDescription(offer);
+
+        socket.emit("offer",{
+          roomId: id,
+          offer
+        });
+        console.log("offre envoyee")
+      }
+    socket.on("connected",(id)=>{
+      ID=id;
+    })
+    socket.on("offer", async data =>{
+      console.log(data.roomId);
+      createPeer(data.roomId);
+      console.log(RTCPeerConnectionWrap.all)
+      const wrap = RTCPeerConnectionWrap.all.filter(x=>x.roomId==data.roomId)[0];
+      let offer = data.offer;
+      await wrap.connection.setRemoteDescription(offer); //On recoie l'offre, on l'accepte ...
+      const answer = await wrap.connection.createAnswer();//On cree une reponse
+      await wrap.connection.setLocalDescription(answer);
       //On l'envoie au remote
       socket.emit("answer",{
-        roomId,
+        roomId: data.roomId,
         answer
       })
       console.log("offre recu et reponse envoyee");
     })
 
     //Si c'est l'utilisateur qui a cree l'offre et qu'une reponse lui est envoyee...
-    socket.on("answer", async answer =>{
-      await peer.setRemoteDescription(answer);
+    socket.on("answer", async data =>{
+      const wrap = RTCPeerConnectionWrap.all.filter(x=>x.roomId==data.roomId)[0];
+      await wrap.connection.setRemoteDescription(data.answer);
       console.log("answered");
     })
 
     //Si on recoie les ICECandidate
-    socket.on("ice-candidate", async candidate =>{
+    socket.on("ice-candidate", async data =>{
+      console.log(data.roomId)
+      const wrap = RTCPeerConnectionWrap.all.filter(x=>x.roomId==data.roomId)[0];
+      console.log(data.candidate);
       try{
-        peer.addIceCandidate(candidate);
+        await wrap.connection.addIceCandidate(data.candidate);
         console.log("iced");
       }catch(err){
         console.log(err);
       }
     })
+
+    socket.on("peering",(remoteID)=>{
+      socket.emit("accept-peering",remoteID);
+      console.log("peering:", remoteID);
+    })
+
+    socket.on("remote-connecting",(remoteID,idRoom)=>{
+      socket.emit("peering-accepted",remoteID);
+      createPeer(idRoom);
+      console.log("rmocn")
+    });
+
+    socket.on("generate-offer",(remoteID,roomId)=>{
+      console.log(RTCPeerConnectionWrap.all)
+      createOffer(roomId);
+      console.log("wooo");
+    })
+
 
     function addMessage(text){
       //Cette fonction ajoute chaque message, qu'il soit envoye ou recu, dans la wone message
@@ -69,65 +139,46 @@
       messages.appendChild(div);
     }
 
-    sender.onclick = ()=>{
-      addMessage(messenger.value); // A chaque fois qu'on envoie un message, il est ajoute a la zone messages...
-      datachannel.send(messenger.value);//Avant d'etre veritablement envoye
-    }
-
    //Ici c'est la fonction qui cree les pair et ce qui est necessqire a leur fonctionnement normal (DataChannel,etc)
-    function createPeer() {
-      peer = new RTCPeerConnection(config); // On cree le pair avec une configuration STUN
+    function createPeer(idRoom) {
+      const wrap = new RTCPeerConnectionWrap(config,idRoom);
+       // On cree le pair avec une configuration STUN
       /*On lui attribue ses evenement*/
-      peer.ontrack = event =>{
+      wrap.connection.ontrack = event =>{
         remoteVideo.srcObject = event.streams[0];
       }
 
-      peer.onicecandidate = event =>{ // cet evenement s'active quand le serveur dde STUN envoie les ICECandidates
+      wrap.connection.onicecandidate = event =>{ // cet evenement s'active quand le serveur dde STUN envoie les ICECandidates
         if(event.candidate){
           console.log(event.candidate);
             socket.emit("ice-candidate",{
-              roomId,
+              roomId: wrap.roomId,
               candidate: event.candidate
             })
             console.log("candidate created")
           }
       }
-      peer.ondatachannel = event =>{
-        datachannel = event.channel;
+      wrap.connection.ondatachannel = event =>{
+        const datachannel = event.channel;
         console.log("data channel received");
+        scale(datachannel);
         datachannel.onmessage = e =>{
           addMessage("Remote: "+e.data);
         }
       }
 
     }
-    async function stratMedia(){
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video:true,
-        audio:true
-      })
-      localVideo.srcObject = localStream;
-      localStream.getTracks().forEach(track=>{
-        peer.addTrack(track, localStream);
-      });
-    }
+    // async function stratMedia(){
+    //   localStream = await navigator.mediaDevices.getUserMedia({
+    //     video:true,
+    //     audio:true
+    //   })
+    //   localVideo.srcObject = localStream;
+    //   localStream.getTracks().forEach(track=>{
+    //     peer.addTrack(track, localStream);
+    //   });
+    // }
 
-      async function createOffer() {
-        datachannel = peer.createDataChannel("chat");
-        datachannel.onopen = ()=>{
-          console.log("data channel is on");
-        }
-        datachannel.onmessage = event=>{
-          addMessage("Remote: "+event.data);
-        }
-        const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
-
-        socket.emit("offer",{
-          roomId,
-          offer
-        });
-      }
       async function init() {
         await stratMedia();
         socket.emit("join-room",roomId);
@@ -136,9 +187,6 @@
       function join(){
         socket.emit("join-room",roomId);
       }
-      createPeer();
-    initialiseur.onclick = init;
-    offerer.onclick = createOffer;
     </script>
   </body>
 </html>
